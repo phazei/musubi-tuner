@@ -20,24 +20,38 @@
 
 	let rawTrainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
 	let rawFullFinetuneStatus = $derived($processStatuses.full_finetune || { state: 'idle', exit_code: null });
+	let rawSliderStatus = $derived($processStatuses.slider_training || { state: 'idle', exit_code: null });
 	let activeProcessType = $derived.by(() => {
 		if (rawFullFinetuneStatus.state === 'running' || rawFullFinetuneStatus.state === 'stopping') return 'full_finetune';
+		if (rawSliderStatus.state === 'running' || rawSliderStatus.state === 'stopping') return 'slider_training';
 		if (rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping') return 'training';
 		if (rawFullFinetuneStatus.state === 'finished' || rawFullFinetuneStatus.state === 'error') return 'full_finetune';
+		if (rawSliderStatus.state === 'finished' || rawSliderStatus.state === 'error') return 'slider_training';
 		return 'training';
 	});
+	// Slider training inherits output_dir and most settings from the training config section.
 	let t = $derived(activeProcessType === 'full_finetune' ? ($projectConfig?.full_finetune || {}) : ($projectConfig?.training || {}));
-	let trainingLive = $derived(activeProcessType === 'full_finetune'
-		? (rawFullFinetuneStatus.state === 'running' || rawFullFinetuneStatus.state === 'stopping')
-		: (rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping'));
-	let trainingStatus = $derived(activeProcessType === 'full_finetune' ? rawFullFinetuneStatus : rawTrainingStatus);
+	let trainingLive = $derived.by(() => {
+		if (activeProcessType === 'full_finetune') return rawFullFinetuneStatus.state === 'running' || rawFullFinetuneStatus.state === 'stopping';
+		if (activeProcessType === 'slider_training') return rawSliderStatus.state === 'running' || rawSliderStatus.state === 'stopping';
+		return rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping';
+	});
+	let trainingStatus = $derived.by(() => {
+		if (activeProcessType === 'full_finetune') return rawFullFinetuneStatus;
+		if (activeProcessType === 'slider_training') return rawSliderStatus;
+		return rawTrainingStatus;
+	});
 	let trainingLogs = $derived($processLogs[activeProcessType] || []);
 	let trainingActive = $derived(trainingLive);
 	let showDashboardData = $derived(trainingLive);
 	let trainingConsoleEmptyMessage = $derived(
 		trainingLive ? 'Training process launched. Waiting for console output...' : 'No output yet'
 	);
-	let configHref = $derived(activeProcessType === 'full_finetune' ? '/training/full-finetune' : '/training');
+	let configHref = $derived.by(() => {
+		if (activeProcessType === 'full_finetune') return '/training/full-finetune';
+		if (activeProcessType === 'slider_training') return '/training/techniques';
+		return '/training';
+	});
 
 	let systemInfo = $state(null);
 	let stats = $state(null);
@@ -73,18 +87,22 @@
 
 	onMount(() => {
 		let disposed = false;
+		const allProcessTypes = ['training', 'full_finetune', 'slider_training'];
 		const init = async () => {
 			const statuses = await refreshStatuses();
 			if (disposed) return;
 			const trainingState = statuses?.training?.state;
 			const fullFinetuneState = statuses?.full_finetune?.state;
-			if (trainingState === 'running' || trainingState === 'stopping' || fullFinetuneState === 'running' || fullFinetuneState === 'stopping') {
-				await preloadLogsIfActive(['training', 'full_finetune']);
+			const sliderState = statuses?.slider_training?.state;
+			const anyActive = [trainingState, fullFinetuneState, sliderState].some(
+				s => s === 'running' || s === 'stopping'
+			);
+			if (anyActive) {
+				await preloadLogsIfActive(allProcessTypes);
 			} else {
 				clearMetrics();
 				clearStatus();
-				clearProcessLogs('training');
-				clearProcessLogs('full_finetune');
+				for (const pt of allProcessTypes) clearProcessLogs(pt);
 			}
 
 			await Promise.all([fetchSystemInfo(), fetchStats()]);
@@ -93,7 +111,7 @@
 
 		const systemInterval = setInterval(fetchSystemInfo, 1000);
 		const statsInterval = setInterval(fetchStats, 3000);
-		const logInterval = startLogPolling(['training', 'full_finetune'], 1000);
+		const logInterval = startLogPolling(allProcessTypes, 1000);
 		return () => {
 			disposed = true;
 			clearInterval(systemInterval);
