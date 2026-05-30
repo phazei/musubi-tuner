@@ -1725,6 +1725,14 @@ class LTX2SliderTrainer:
             grad_norm_value = None
             _step_start_time = time.perf_counter()
 
+            import os as _os
+            _do_prof = _os.getenv("NVFP4_TORCHPROF", "0") == "1" and global_step == 4
+            _prof_ctx = None
+            if _do_prof:
+                from torch.profiler import profile as _tprofile, ProfilerActivity
+                _prof_ctx = _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                _prof_ctx.__enter__()
+
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
                     loss = self._text_slider_step(transformer, network, accelerator, args, dit_dtype)
@@ -1760,6 +1768,16 @@ class LTX2SliderTrainer:
                             args.scale_weight_norms, accelerator.device
                         )
 
+            if _prof_ctx is not None:
+                import torch as _torch
+                _torch.cuda.synchronize()
+                _prof_ctx.__exit__(None, None, None)
+                _ka = _prof_ctx.key_averages()
+                _cpu = sum(k.self_cpu_time_total for k in _ka)
+                _cuda = sum(k.self_device_time_total for k in _ka)
+                print(f"\n[NVFP4-TORCHPROF] self CPU total={_cpu/1e3:.1f}ms self CUDA total={_cuda/1e3:.1f}ms", flush=True)
+                print(_ka.table(sort_by="self_cpu_time_total", row_limit=15), flush=True)
+
             if not accelerator.sync_gradients:
                 continue
 
@@ -1767,6 +1785,12 @@ class LTX2SliderTrainer:
                 progress_bar.reset()
             progress_bar.update(1)
             global_step += 1
+
+            import os as _os
+            if _os.getenv("NVFP4_STEPTIME", "0") == "1":
+                import torch as _t
+                _t.cuda.synchronize()
+                print(f"[STEPTIME] step={global_step} {time.perf_counter()-_step_start_time:.3f}s", flush=True)
 
             loss_recorder.add(epoch=0, step=global_step - 1, loss=loss)
             avr_loss = loss_recorder.moving_average

@@ -3098,6 +3098,7 @@ Additional notes:
 - **Guidance strength**: For text-only mode, the default is `1.0`. Values of `2.0-3.0` increase direction strength but may reduce convergence stability.
 - **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
 - **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.
+- **Do not use `--compile`**: For slider training, the fastest configuration is plain eager mode with `--sage_attn --gradient_checkpointing` (plus `--fp8_base --fp8_scaled` for the 22B model). `torch.compile` provides no speedup here and can regress performance. See [Why `torch.compile` Does Not Help for Slider Training](./ltx2_slider_why_not_compile.md) for the (non-intuitive) details.
 
 ---
 
@@ -3620,6 +3621,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [Tools](./tools.md) — Post-hoc EMA LoRA merging, image captioning with Qwen2.5-VL
 - [LoHa/LoKr](./loha_lokr.md) — Alternative parameter-efficient fine-tuning methods
 - [torch.compile](./torch_compile.md) — PyTorch JIT compilation for faster training and inference
+- [Why `torch.compile` Does Not Help for Slider Training](./ltx2_slider_why_not_compile.md) — Benchmarks and non-intuitive findings on compile, gradient checkpointing, and the slider's 3-pass grad-mode behavior
 - [LyCORIS Algorithm List](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [Guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) — LoKR, LoHA, LoCoN and other algorithm details (used via `pip install lycoris-lora`)
 
 **Research**

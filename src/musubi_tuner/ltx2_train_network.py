@@ -30,6 +30,7 @@ from musubi_tuner.modules.nf4_optimization_utils import (
     is_nf4_module,
     DEFAULT_NF4_BLOCK_SIZE,
 )
+from musubi_tuner.modules.nvfp4_utils import is_nvfp4_module
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_text_conditioning import (
     select_audio_text_embeds_for_audio_mode,
@@ -2336,6 +2337,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if not any(True for _ in model.parameters()):
             return
 
+        # NVFP4 base models are auto-detected (no fp8 flag), so their packed
+        # weight + scale buffers won't be covered by the fp8/nf4 branches at the
+        # call sites. Since this hook is invoked everywhere a forward is about to
+        # run, co-locate any NVFP4 buffers here too (cheap no-op when none exist).
+        self._ensure_nvfp4_buffers_on_device(model)
+
         # If block swap is enabled, we must NOT call ensure_fp8_modules_on_device on the entire model
         # because it would move all swapped blocks from CPU to GPU, defeating block swapping.
         # Instead, process only non-swapped parts of the model.
@@ -2432,6 +2439,68 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     _sync_nf4_buffers(block, target_device)
         else:
             _sync_nf4_buffers(model, target_device)
+
+    def _ensure_nvfp4_buffers_on_device(self, model: torch.nn.Module) -> None:
+        """Co-locate NVFP4 packed weight + scale buffers with the model device.
+
+        The native FP4 forward (scaled_mm) needs the packed uint8 ``weight``, the
+        natural ``nvfp4_block_scale`` (used by the bf16 backward decode), the
+        pre-swizzled ``nvfp4_block_scale_swizzled`` (used by the forward GEMM) and
+        the per-tensor ``nvfp4_tensor_scale`` all on the same CUDA device. Mirrors
+        ``_ensure_nf4_buffers_on_device`` but for NVFP4 modules. Respects block
+        swap / model-parallel placement.
+        """
+        if not any(True for _ in model.parameters()):
+            return
+
+        base_model = model.model if hasattr(model, "model") else model
+        try:
+            from musubi_tuner.ltx2_model_parallel import get_ltx2_model_parallel_plan
+
+            mp_plan = get_ltx2_model_parallel_plan(base_model)
+        except Exception:
+            mp_plan = None
+
+        blocks_to_swap = getattr(base_model, "blocks_to_swap", 0) or 0
+
+        _NVFP4_BUFFER_NAMES = (
+            "weight",
+            "nvfp4_block_scale",
+            "nvfp4_block_scale_swizzled",
+            "nvfp4_tensor_scale",
+        )
+
+        def _sync_nvfp4_buffers(module: torch.nn.Module, device: torch.device) -> None:
+            for submodule in module.modules():
+                if is_nvfp4_module(submodule):
+                    for buf_name in _NVFP4_BUFFER_NAMES:
+                        t = getattr(submodule, buf_name, None)
+                        if isinstance(t, torch.Tensor) and t.device != device:
+                            setattr(submodule, buf_name, t.to(device))
+
+        if mp_plan is not None and hasattr(base_model, "transformer_blocks"):
+            for name, child in base_model.named_children():
+                if name == "transformer_blocks":
+                    continue
+                _sync_nvfp4_buffers(child, mp_plan.input_device)
+            for idx, block in enumerate(base_model.transformer_blocks):
+                _sync_nvfp4_buffers(block, mp_plan.block_devices[idx])
+            return
+
+        target_device = next(model.parameters()).device
+
+        if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
+            for name, child in base_model.named_children():
+                if name == "transformer_blocks":
+                    continue
+                _sync_nvfp4_buffers(child, target_device)
+            num_blocks = len(base_model.transformer_blocks)
+            swap_start = max(0, num_blocks - blocks_to_swap)
+            for idx, block in enumerate(base_model.transformer_blocks):
+                if idx < swap_start:
+                    _sync_nvfp4_buffers(block, target_device)
+        else:
+            _sync_nvfp4_buffers(model, target_device)
 
     class _DeferredVAE:
         def __init__(self) -> None:
@@ -4186,6 +4255,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(transformer)
+            else:
+                # NVFP4 base is auto-detected (no flag); ensure its buffers are placed.
+                self._ensure_nvfp4_buffers_on_device(transformer)
             if is_ltx2_remote_stage_enabled(args):
                 set_ltx2_remote_stage_cache_key(
                     transformer,
@@ -4514,6 +4586,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)
+            else:
+                # NVFP4 base is auto-detected (no flag); ensure its buffers are placed.
+                self._ensure_nvfp4_buffers_on_device(unwrapped_transformer)
             with accelerator.autocast():
                 if hasattr(unwrapped_transformer, "forward_modalities"):
                     pred_tokens, _ = unwrapped_transformer.forward_modalities(video_modality, None, perturbations)
@@ -4862,6 +4937,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)
+            else:
+                # NVFP4 base is auto-detected (no flag); ensure its buffers are placed.
+                self._ensure_nvfp4_buffers_on_device(unwrapped_transformer)
             with accelerator.autocast():
                 if hasattr(unwrapped_transformer, "forward_modalities"):
                     video_pred_all, audio_pred_all = unwrapped_transformer.forward_modalities(
@@ -5432,6 +5510,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)
+            else:
+                # NVFP4 base is auto-detected (no flag); ensure its buffers are placed.
+                self._ensure_nvfp4_buffers_on_device(unwrapped_transformer)
             with accelerator.autocast():
                 if hasattr(unwrapped_transformer, "forward_modalities"):
                     video_pred_all, audio_pred_all = unwrapped_transformer.forward_modalities(
